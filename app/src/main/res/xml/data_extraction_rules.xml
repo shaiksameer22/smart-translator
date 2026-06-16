@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Exclude all app data from both cloud backup and device-to-device transfer so that
+    translation history and settings can never be exfiltrated through Android's backup
+    channels. (allowBackup="false" already disables cloud backup; this also covers the
+    Android 12+ device-transfer path.)
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

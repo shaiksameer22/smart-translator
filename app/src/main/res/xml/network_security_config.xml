@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Security posture:
+    - cleartextTrafficPermitted="false": the app only ever talks HTTPS (ML Kit model
+      downloads go to Google's CDN over TLS), so plaintext HTTP is forbidden outright.
+    - trust-anchors = system only: user-/admin-installed CA certificates are NOT trusted,
+      which blocks man-in-the-middle interception via a rogue CA (proxy/Frida-style attacks).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
