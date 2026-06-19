@@ -65,11 +65,11 @@ class TranslatorViewModel @JvmOverloads constructor(
     private var lastAction: (() -> Unit)? = null
 
     /**
-     * The OCR'd pages from the most recent PDF, cached so a language change can re-translate and
+     * The OCR'd page layouts from the most recent PDF, cached so a language change can re-translate and
      * rebuild the PDF without re-scanning hundreds of pages. Null when the last source was an
      * image or typed text.
      */
-    private var pdfPages: List<String>? = null
+    private var pdfPages: List<PageLayout>? = null
 
     var sourceLanguage by mutableStateOf(AUTO_LANGUAGE)
     var targetLanguage by mutableStateOf(TranslateLanguage.ENGLISH)
@@ -113,15 +113,15 @@ class TranslatorViewModel @JvmOverloads constructor(
                 // count), so phase-1 detail is expressed as a percentage rather than "page X of N".
                 statusMessage = "Reading PDF"
                 statusDetail = null
-                val pages = pdfProcessor.extractPages(uri, ocrSource) { p ->
+                val layouts = pdfProcessor.extractPages(uri, ocrSource) { p ->
                     progress = p * 0.5f
                     statusDetail = "${(p * 100).toInt()}%"
                 }
-                // Cache the OCR'd pages so a later language change rebuilds the PDF without re-scanning.
-                pdfPages = pages
+                // Cache the OCR'd layouts so a later language change rebuilds the PDF without re-scanning.
+                pdfPages = layouts
 
                 // OCR consumed the first half of the bar; translation + build fill the second half.
-                translateAndBuildPdf(pages, progressBase = 0.5f)
+                translateAndBuildPdf(layouts, progressBase = 0.5f)
             } catch (e: CancellationException) {
                 throw e // Let cancellation propagate; never surface it as an error.
             } catch (e: Exception) {
@@ -138,15 +138,15 @@ class TranslatorViewModel @JvmOverloads constructor(
      * Re-translates and rebuilds the PDF from already-OCR'd [pages] — used when the user changes the
      * target/source language after a PDF translation, so we skip re-scanning hundreds of pages.
      */
-    private fun retranslatePdf(pages: List<String>) {
-        lastAction = { retranslatePdf(pages) }
+    private fun retranslatePdf(layouts: List<PageLayout>) {
+        lastAction = { retranslatePdf(layouts) }
         val previous = currentJob
         currentJob = viewModelScope.launch {
             previous?.cancelAndJoin()
             startProcessing()
             try {
                 // No OCR this time, so translation + build own the whole progress bar.
-                translateAndBuildPdf(pages, progressBase = 0f)
+                translateAndBuildPdf(layouts, progressBase = 0f)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -164,45 +164,57 @@ class TranslatorViewModel @JvmOverloads constructor(
      * translator, rebuilds the translated PDF, and records history. [progressBase] is where the
      * translation phase starts on the bar (0.5 after OCR, 0 when re-translating cached pages).
      */
-    private suspend fun translateAndBuildPdf(pages: List<String>, progressBase: Float) {
-        originalText = joinPages(pages)
-        if (pages.all { it.isBlank() }) {
+    private suspend fun translateAndBuildPdf(layouts: List<PageLayout>, progressBase: Float) {
+        originalText = joinPages(layouts)
+        if (layouts.all { it.blocks.isEmpty() }) {
             errorMessage = "No readable text was found in this PDF. Try a clearer scan."
             return
         }
 
-        // Detect the source language once from a representative page, then reuse it for all pages.
-        val sample = pages.firstOrNull { it.isNotBlank() }.orEmpty()
+        // Detect the source language once from a representative page, then reuse it for all blocks.
+        val sample = layouts.firstOrNull { it.blocks.isNotEmpty() }?.text.orEmpty()
         val actualSourceLang = resolveSourceLanguage(sample)
         val span = 1f - progressBase
 
-        // Translate all pages through ONE translator with the model downloaded once. The download is
-        // reported separately so a slow first-run download shows "Downloading language pack…".
+        // Flatten every block across all pages into one batch so the whole document translates through
+        // ONE translator with the model downloaded once. Block geometry is rebuilt from the same order.
+        val blockTexts = layouts.flatMap { page -> page.blocks.map { it.text } }
+        val pageCount = layouts.size
+
         statusMessage = "Translating PDF"
-        val translatedPages = translationEngine.translatePages(
-            pages,
+        val translatedTexts = translationEngine.translatePages(
+            blockTexts,
             actualSourceLang,
             targetLanguage,
             onModelDownloadStart = {
                 statusDetail = "Downloading language pack… (first time only)"
             },
             onPageTranslated = { index ->
-                progress = progressBase + (index + 1).toFloat() / pages.size * span
-                statusDetail = "Page ${index + 1} of ${pages.size}"
+                progress = progressBase + (index + 1).toFloat() / blockTexts.size * span
+                statusDetail = "Block ${index + 1} of ${blockTexts.size} ($pageCount pages)"
             }
         )
-        translatedText = joinPages(translatedPages)
+
+        // Rebuild each page's layout with translated text, keeping every block's position + font size.
+        var cursor = 0
+        val translatedLayouts = layouts.map { page ->
+            val blocks = page.blocks.map { block ->
+                block.copy(text = translatedTexts.getOrElse(cursor) { block.text }).also { cursor++ }
+            }
+            page.copy(blocks = blocks)
+        }
+        translatedText = joinPages(translatedLayouts)
 
         // Rebuild the document as a translated PDF saved to Downloads.
         statusMessage = "Processing the PDF"
         statusDetail = null
-        translatedPdfUri = pdfProcessor.createTranslatedPdf(translatedPages)
+        translatedPdfUri = pdfProcessor.createTranslatedPdf(translatedLayouts)
 
         recordHistory(originalText, translatedText, actualSourceLang, targetLanguage)
     }
 
-    private fun joinPages(pages: List<String>): String =
-        pages.mapIndexed { i, text -> "--- Page ${i + 1} ---\n$text" }.joinToString("\n\n")
+    private fun joinPages(layouts: List<PageLayout>): String =
+        layouts.mapIndexed { i, page -> "--- Page ${i + 1} ---\n${page.text}" }.joinToString("\n\n")
 
     fun processText(text: String) {
         lastAction = { processText(text) }

@@ -43,6 +43,10 @@ class TranslatorViewModelTest {
         Dispatchers.resetMain()
     }
 
+    /** A one-block page layout per supplied text (geometry is irrelevant to the ViewModel logic). */
+    private fun pageOf(text: String) =
+        PageLayout(100, 100, if (text.isBlank()) emptyList() else listOf(LayoutBlock(text, 0f, 0f, 80f, 12f, 12f)))
+
     @Test
     fun `processImage updates originalText and translates`() = runTest {
         val uri = mockk<Uri>()
@@ -70,12 +74,13 @@ class TranslatorViewModelTest {
     fun `processPdf OCRs every page, translates each, and builds a translated PDF`() = runTest {
         val uri = mockk<Uri>()
         val pdfUri = mockk<Uri>()
-        val pages = listOf("Page one", "Page two")
+        val pages = listOf(pageOf("Page one"), pageOf("Page two"))
 
         coEvery { pdfProcessor.extractPages(uri, any(), any()) } coAnswers { delay(1000); pages }
         coEvery { translationEngine.detectLanguage(any()) } returns TranslateLanguage.ENGLISH
+        // Blocks are flattened across pages into one batch before translating.
         coEvery {
-            translationEngine.translatePages(pages, any(), any(), any(), any())
+            translationEngine.translatePages(listOf("Page one", "Page two"), any(), any(), any(), any())
         } returns listOf("Translated one", "Translated two")
         coEvery { pdfProcessor.createTranslatedPdf(any()) } returns pdfUri
 
@@ -93,18 +98,25 @@ class TranslatorViewModelTest {
         assertTrue(viewModel.translatedText.contains("Translated two"))
         assertEquals(pdfUri, viewModel.translatedPdfUri)
         assertFalse(viewModel.isProcessing)
-        coVerify(exactly = 1) { pdfProcessor.createTranslatedPdf(listOf("Translated one", "Translated two")) }
+        // The rebuilt layouts carry the translated text at the original block positions.
+        coVerify(exactly = 1) {
+            pdfProcessor.createTranslatedPdf(match { layouts ->
+                layouts.flatMap { it.blocks.map { b -> b.text } } == listOf("Translated one", "Translated two")
+            })
+        }
     }
 
     @Test
     fun `changing PDF language does not auto-rebuild, but explicit retranslate rebuilds without re-OCR`() = runTest {
         val uri = mockk<Uri>()
         val pdfUri = mockk<Uri>()
-        val pages = listOf("Page one", "Page two")
+        val pages = listOf(pageOf("Page one"), pageOf("Page two"))
 
         coEvery { pdfProcessor.extractPages(uri, any(), any()) } returns pages
         coEvery { translationEngine.detectLanguage(any()) } returns TranslateLanguage.ENGLISH
-        coEvery { translationEngine.translatePages(pages, any(), any(), any(), any()) } returns listOf("t1", "t2")
+        coEvery {
+            translationEngine.translatePages(listOf("Page one", "Page two"), any(), any(), any(), any())
+        } returns listOf("t1", "t2")
         coEvery { pdfProcessor.createTranslatedPdf(any()) } returns pdfUri
 
         viewModel.processPdf(uri)
@@ -129,7 +141,7 @@ class TranslatorViewModelTest {
     fun `cancelProcessing stops an in-flight job without showing an error`() = runTest {
         val uri = mockk<Uri>()
         // Park the job in a long-running OCR call so we can cancel mid-flight.
-        coEvery { pdfProcessor.extractPages(uri, any(), any()) } coAnswers { delay(10_000); listOf("x") }
+        coEvery { pdfProcessor.extractPages(uri, any(), any()) } coAnswers { delay(10_000); listOf(pageOf("x")) }
 
         viewModel.processPdf(uri)
         runCurrent()
@@ -194,7 +206,7 @@ class TranslatorViewModelTest {
     @Test
     fun `processPdf reports an error and builds no PDF when every page is blank`() = runTest {
         val uri = mockk<Uri>()
-        coEvery { pdfProcessor.extractPages(uri, any(), any()) } returns listOf("", "  ")
+        coEvery { pdfProcessor.extractPages(uri, any(), any()) } returns listOf(pageOf(""), pageOf("  "))
 
         viewModel.processPdf(uri)
         advanceUntilIdle()

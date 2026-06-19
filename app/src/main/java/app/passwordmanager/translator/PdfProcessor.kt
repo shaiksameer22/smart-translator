@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
@@ -21,14 +22,14 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
         uri: Uri,
         sourceLanguage: String?,
         onProgress: (Float) -> Unit
-    ): List<String> = withContext(Dispatchers.IO) {
+    ): List<PageLayout> = withContext(Dispatchers.IO) {
         val contentResolver = context.contentResolver
         val fileDescriptor: ParcelFileDescriptor = contentResolver.openFileDescriptor(uri, "r")
             ?: throw IllegalStateException("Could not open the selected PDF file.")
 
         val renderer = PdfRenderer(fileDescriptor)
         val totalPages = renderer.pageCount
-        val pages = ArrayList<String>(totalPages)
+        val pages = ArrayList<PageLayout>(totalPages)
 
         // Failures propagate to the caller (shown as an error banner); cleanup runs regardless.
         try {
@@ -36,7 +37,9 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
                 val page = renderer.openPage(i)
                 // Render at 2x for sharper OCR on text-dense pages, then recycle to keep memory flat
                 // across hundreds of pages.
-                val bitmap = Bitmap.createBitmap(page.width * 2, page.height * 2, Bitmap.Config.ARGB_8888)
+                val width = page.width * 2
+                val height = page.height * 2
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 try {
                     bitmap.eraseColor(Color.WHITE)
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -47,7 +50,7 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
                 // recycle() in finally so a failed/cancelled OCR can't leak the ~8 MB bitmap.
                 try {
                     val image = InputImage.fromBitmap(bitmap, 0)
-                    pages.add(TextRecognizers.recognize(image, sourceLanguage))
+                    pages.add(PageLayout(width, height, TextRecognizers.recognizeBlocks(image, sourceLanguage)))
                 } finally {
                     bitmap.recycle()
                 }
@@ -62,16 +65,13 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
         return@withContext pages
     }
 
-    override suspend fun createTranslatedPdf(pages: List<String>): Uri = withContext(Dispatchers.IO) {
+    override suspend fun createTranslatedPdf(pages: List<PageLayout>): Uri = withContext(Dispatchers.IO) {
         val document = PdfDocument()
-        // Default typeface (no setTypeface): renders Latin and falls back for non-Latin scripts
-        // (Hindi, Chinese, etc.) so we never drop glyphs the chosen font lacks.
         val paint = TextPaint().apply {
             color = Color.BLACK
-            textSize = TEXT_SIZE
             isAntiAlias = true
         }
-        // Smaller, lighter paint shared by the footer page number and the running source-page header.
+        // Smaller, lighter paint for the footer page number.
         val accentPaint = TextPaint().apply {
             color = ACCENT_COLOR
             textSize = ACCENT_TEXT_SIZE
@@ -80,66 +80,19 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
         }
 
         // An empty document is invalid; emit a single placeholder page so callers always get a PDF.
-        val sourcePages = pages.ifEmpty { listOf("No content") }
+        val sourcePages = pages.ifEmpty { listOf(PageLayout(PAGE_WIDTH, PAGE_HEIGHT, emptyList())) }
 
-        var pageNumber = 1
         try {
-            sourcePages.forEachIndexed { sourceIndex, pageText ->
-                // StaticLayout needs non-empty content; keep blank source pages as blank output pages.
-                val text = pageText.ifBlank { " " }
-                val layout = StaticLayout.Builder
-                    .obtain(text, 0, text.length, paint, CONTENT_WIDTH)
-                    .setLineSpacing(LINE_SPACING_EXTRA, 1f)
-                    .build()
+            sourcePages.forEachIndexed { index, pageLayout ->
+                val pageInfo = PdfDocument.PageInfo
+                    .Builder(PAGE_WIDTH, PAGE_HEIGHT, index + 1)
+                    .create()
+                val page = document.startPage(pageInfo)
+                drawPage(page.canvas, pageLayout, paint)
 
-                // A single source page can hold more text than fits on one output page, so paginate
-                // by slicing the layout into vertical bands that each fit the printable area. BODY_HEIGHT
-                // (not CONTENT_HEIGHT) leaves room at the bottom so body text never sits under the footer.
-                var startLine = 0
-                var firstBandOfSource = true
-                do {
-                    val bandTop = layout.getLineTop(startLine)
-                    var endLine = startLine
-                    while (endLine < layout.lineCount &&
-                        layout.getLineBottom(endLine) - bandTop <= BODY_HEIGHT
-                    ) {
-                        endLine++
-                    }
-                    if (endLine == startLine) endLine = startLine + 1 // guarantee forward progress
-
-                    val pageInfo = PdfDocument.PageInfo
-                        .Builder(PAGE_WIDTH, PAGE_HEIGHT, pageNumber)
-                        .create()
-                    val page = document.startPage(pageInfo)
-                    val canvas = page.canvas
-
-                    // Faint running header on the first output page produced for each source page, so the
-                    // reader can see where each original page begins.
-                    if (firstBandOfSource) {
-                        canvas.drawText(
-                            "— Page ${sourceIndex + 1} —",
-                            PAGE_WIDTH / 2f,
-                            HEADER_BASELINE,
-                            accentPaint
-                        )
-                    }
-
-                    canvas.save()
-                    canvas.translate(MARGIN.toFloat(), (BODY_TOP - bandTop).toFloat())
-                    // Clip to this band so spill-over lines aren't drawn over the footer or next page.
-                    canvas.clipRect(0f, bandTop.toFloat(), CONTENT_WIDTH.toFloat(), (bandTop + BODY_HEIGHT).toFloat())
-                    layout.draw(canvas)
-                    canvas.restore()
-
-                    // Centered footer page number, drawn after the body so it's never clipped away.
-                    canvas.drawText("Page $pageNumber", PAGE_WIDTH / 2f, FOOTER_BASELINE, accentPaint)
-
-                    document.finishPage(page)
-
-                    pageNumber++
-                    firstBandOfSource = false
-                    startLine = endLine
-                } while (startLine < layout.lineCount)
+                // Centered footer page number.
+                page.canvas.drawText("Page ${index + 1}", PAGE_WIDTH / 2f, FOOTER_BASELINE, accentPaint)
+                document.finishPage(page)
             }
 
             return@withContext writeToDownloads(document)
@@ -153,6 +106,54 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
             )
         } finally {
             document.close()
+        }
+    }
+
+    /**
+     * Redraws each translated block at its original (scaled) position with a font size proportional to
+     * the original glyph height — so headings stay large and columns/tables keep their layout. The
+     * source bitmap is fitted into the printable A4 area (aspect preserved) and centered.
+     */
+    private fun drawPage(canvas: android.graphics.Canvas, layout: PageLayout, paint: TextPaint) {
+        if (layout.blocks.isEmpty()) return
+
+        // Scale the page bitmap to fit the printable area, preserving aspect ratio, then center it.
+        val scale = minOf(
+            CONTENT_WIDTH.toFloat() / layout.widthPx,
+            CONTENT_HEIGHT.toFloat() / layout.heightPx
+        )
+        val offsetX = MARGIN + (CONTENT_WIDTH - layout.widthPx * scale) / 2f
+        val offsetY = MARGIN + (CONTENT_HEIGHT - layout.heightPx * scale) / 2f
+
+        // Median original font size on the page → blocks noticeably larger are treated as headings
+        // (rendered bold) so the translated PDF keeps the original's visual hierarchy.
+        val sizes = layout.blocks.map { it.fontSizePx }.sorted()
+        val medianSize = sizes[sizes.size / 2]
+
+        for (block in layout.blocks) {
+            val fontSize = (block.fontSizePx * scale).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+            val isHeading = block.fontSizePx >= medianSize * HEADING_RATIO
+            paint.textSize = fontSize
+            paint.typeface = if (isHeading) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+
+            // Block width in points; guarantee a minimum so a narrow box still wraps readably.
+            val blockWidth = ((block.right - block.left) * scale)
+                .coerceAtLeast(fontSize * 4f)
+                .toInt()
+                .coerceAtMost(CONTENT_WIDTH)
+
+            val textLayout = StaticLayout.Builder
+                .obtain(block.text, 0, block.text.length, paint, blockWidth)
+                .setLineSpacing(LINE_SPACING_EXTRA, 1f)
+                .build()
+
+            val x = offsetX + block.left * scale
+            val y = offsetY + block.top * scale
+
+            canvas.save()
+            canvas.translate(x, y)
+            textLayout.draw(canvas)
+            canvas.restore()
         }
     }
 
@@ -191,23 +192,19 @@ class PdfProcessor(private val context: Context) : IPdfProcessor {
         const val PAGE_WIDTH = 595
         const val PAGE_HEIGHT = 842
         const val MARGIN = 40
-        const val TEXT_SIZE = 12f
         const val LINE_SPACING_EXTRA = 2f
         const val CONTENT_WIDTH = PAGE_WIDTH - 2 * MARGIN
         const val CONTENT_HEIGHT = PAGE_HEIGHT - 2 * MARGIN
 
-        // Header (source-page marker) and footer (page number) furniture: smaller, lighter text.
+        // Proportional-font clamps so tiny captions stay legible and huge titles don't blow the layout.
+        const val MIN_FONT_SIZE = 7f
+        const val MAX_FONT_SIZE = 32f
+        // A block this much taller than the page median is treated as a heading (rendered bold).
+        const val HEADING_RATIO = 1.3f
+
+        // Footer page-number furniture.
         const val ACCENT_TEXT_SIZE = 9f
         const val ACCENT_COLOR = 0xFF999999.toInt() // light grey
-        const val HEADER_HEIGHT = 14   // vertical band reserved at the top for the running header
-        const val FOOTER_HEIGHT = 16   // vertical band reserved at the bottom for the page number
-
-        // Body band: the printable area minus the header/footer reservations so text never overlaps them.
-        const val BODY_TOP = MARGIN + HEADER_HEIGHT
-        const val BODY_HEIGHT = CONTENT_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT
-
-        // Baselines for the furniture, kept within the top/bottom margins.
-        const val HEADER_BASELINE = MARGIN + ACCENT_TEXT_SIZE
         const val FOOTER_BASELINE = PAGE_HEIGHT - MARGIN + ACCENT_TEXT_SIZE
     }
 }

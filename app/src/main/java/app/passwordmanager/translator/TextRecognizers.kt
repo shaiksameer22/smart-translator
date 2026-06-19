@@ -67,22 +67,58 @@ object TextRecognizers {
     fun isOcrSupported(languageTag: String?): Boolean =
         languageTag == null || languageTag == TranslatorViewModel.AUTO_LANGUAGE || languageTag !in ocrUnsupported
 
-    suspend fun recognize(image: InputImage, sourceLanguage: String? = null): String {
+    suspend fun recognize(image: InputImage, sourceLanguage: String? = null): String =
+        bestResult(image, sourceLanguage)?.let { orderedText(it) }.orEmpty()
+
+    /**
+     * OCRs the image and returns each text block with its position + estimated font size, so the PDF
+     * rebuilder can redraw translated text in place (preserving headings, columns, tables) instead of
+     * reflowing everything into one column.
+     */
+    suspend fun recognizeBlocks(image: InputImage, sourceLanguage: String? = null): List<LayoutBlock> {
+        val result = bestResult(image, sourceLanguage) ?: return emptyList()
+        return result.textBlocks.mapNotNull { block ->
+            val box = block.boundingBox ?: return@mapNotNull null
+            val text = block.text.trim()
+            if (text.isEmpty()) return@mapNotNull null
+            LayoutBlock(
+                text = text,
+                left = box.left.toFloat(),
+                top = box.top.toFloat(),
+                right = box.right.toFloat(),
+                bottom = box.bottom.toFloat(),
+                fontSizePx = estimateFontSize(block)
+            )
+        }.sortedWith(compareBy({ it.top }, { it.left }))
+    }
+
+    /** The winning OCR result: the matching recognizer when the source is known, else the richest of all five. */
+    private suspend fun bestResult(image: InputImage, sourceLanguage: String?): Text? {
         val recognizer = recognizerFor(sourceLanguage)
         if (recognizer != null) {
-            val result = runCatching { recognizer.process(image).await() }.getOrNull()
-            return result?.let { orderedText(it) }.orEmpty()
+            return runCatching { recognizer.process(image).await() }.getOrNull()
         }
-        // Auto/unknown: run every recognizer concurrently and keep the result with the most text.
         return coroutineScope {
             listOf(latin, devanagari, chinese, japanese, korean)
                 .map { r -> async { runCatching { r.process(image).await() }.getOrNull() } }
                 .awaitAll()
                 .filterNotNull()
                 .maxByOrNull { it.text.length }
-                ?.let { orderedText(it) }
-                .orEmpty()
         }
+    }
+
+    /**
+     * Estimates a block's original glyph height in pixels from the median height of its lines (falling
+     * back to the block box height). Drives proportional font sizing in the rebuilt PDF so headings
+     * render bigger than body text instead of everything collapsing to one size.
+     */
+    private fun estimateFontSize(block: Text.TextBlock): Float {
+        val lineHeights = block.lines.mapNotNull { it.boundingBox?.height()?.toFloat() }.filter { it > 0f }
+        if (lineHeights.isNotEmpty()) {
+            val sorted = lineHeights.sorted()
+            return sorted[sorted.size / 2]
+        }
+        return block.boundingBox?.height()?.toFloat() ?: 0f
     }
 
     /**
