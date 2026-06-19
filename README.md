@@ -22,7 +22,7 @@ Fully offline Android translator. Image / PDF / text / speech → translation, a
 
 ### Option A — Install the APK
 
-1. Download `app-debug.apk` from the latest build (or [Releases](../../releases)).
+1. Download [app-debug.apk](../../releases/latest/download/app-debug.apk) (or browse [Releases](../../releases)).
 2. On the device, enable **Settings → Apps → Special access → Install unknown apps** for your file manager/browser.
 3. Open the APK and tap **Install**.
 
